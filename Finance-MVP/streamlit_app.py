@@ -1,149 +1,196 @@
 import streamlit as st
 import pandas as pd
+from typing import List, Literal
+from pydantic import BaseModel, Field
 
-from scenario_engine import run_scenarios, ScenarioInput
-from narratives import generate_improved_narratives, display_narratives_streamlit
-from questions_repo import INITIAL_QUESTIONS, ADDITIONAL_QUESTIONS
+# ============================================================
+# SCENARIO ENGINE (merged from scenario_engine.py)
+# ============================================================
 
-# -----------------------------
-# App Configuration
-# -----------------------------
-st.set_page_config(page_title="Finance MVP", layout="wide")
+class ScenarioInput(BaseModel):
+    lump_sum: float = Field(..., ge=0)
+    monthly_free_cash: float = Field(0, ge=0)
+    debt_balance: float = Field(0, ge=0)
+    apr: float = Field(0, ge=0, le=100)
+    min_payment: float = Field(0, ge=0)
+    invest_return: float = Field(7.0, ge=-100, le=100)
+    emergency_fund_goal: float = Field(0, ge=0)
+    months: int = Field(60, ge=1, le=360)
+    assumed_happiness: int = Field(60, ge=0, le=100)
 
-st.title("💸 Personal Finance Scenario Planner")
-st.markdown("Answer a few questions, enter your financial info, and compare strategies for debt payoff, investing, and saving.")
+class ScenarioResult(BaseModel):
+    name: Literal["Pay Debt", "Invest", "Save", "Hybrid", "Debt+EF"]
+    end_balance: float
+    interest_saved: float
+    investment_value: float
+    liquidity: float
+    time_to_debt_free_months: int
 
-# -----------------------------
-# Section 1: Financial Well-Being Questions
-# -----------------------------
-st.header("Step 1: Financial Well-Being Checkup")
+def _monthly_rate(apr_pct: float) -> float:
+    return (apr_pct / 100.0) / 12.0
 
-responses = {}
-for i, q in enumerate(INITIAL_QUESTIONS, start=1):
-    responses[i] = st.slider(q, 0, 5, 3)
+def _future_value(monthly_contrib: float, months: int, annual_return_pct: float) -> float:
+    r = (annual_return_pct / 100.0) / 12.0
+    fv = 0.0
+    for _ in range(months):
+        fv = fv * (1 + r) + monthly_contrib
+    return fv
 
-# Calculate score (simple sum for now)
-happiness_score = sum(responses.values()) * 4  # CFPB scale is 0–100
-st.metric("Your Financial Well-Being Score", happiness_score)
+def _amortize(balance: float, apr_pct: float, monthly_payment: float, months: int):
+    r = _monthly_rate(apr_pct)
+    interest_paid = 0.0
+    for m in range(1, months + 1):
+        interest = balance * r
+        principal = max(0.0, monthly_payment - interest)
+        interest_paid += interest
+        balance = max(0.0, balance - principal)
+        if balance <= 0.01:
+            return interest_paid, m
+    return interest_paid, months
 
-# -----------------------------
-# Section 2: Debt Information
-# -----------------------------
-st.header("Step 2: Enter Your Debts")
+def run_scenarios(inp: ScenarioInput) -> List[ScenarioResult]:
+    res: List[ScenarioResult] = []
 
-num_debts = st.number_input("How many debts do you have?", min_value=0, max_value=10, value=1, step=1)
+    # Scenario A: Pay Debt
+    lump_to_debt = min(inp.lump_sum, inp.debt_balance)
+    new_balance = max(0.0, inp.debt_balance - lump_to_debt)
+    extra = inp.monthly_free_cash
+    interest_paid_a, months_a = _amortize(new_balance, inp.apr, inp.min_payment + extra, inp.months)
+    res.append(ScenarioResult(
+        name="Pay Debt",
+        end_balance=0.0,
+        interest_saved=max(0.0, _amortize(inp.debt_balance, inp.apr, inp.min_payment, inp.months)[0] - interest_paid_a),
+        investment_value=0.0,
+        liquidity=max(0.0, inp.emergency_fund_goal),
+        time_to_debt_free_months=months_a
+    ))
 
-debts = []
-for i in range(num_debts):
-    st.subheader(f"Debt {i+1}")
-    debt_type = st.selectbox("Type of Debt", ["Credit Card", "Student Loan", "Auto Loan", "Mortgage", "Personal Loan"], key=f"type_{i}")
-    balance = st.number_input("Balance ($)", min_value=0.0, step=100.0, key=f"balance_{i}")
-    apr = st.number_input("APR (%)", min_value=0.0, step=0.1, key=f"apr_{i}")
-    min_payment = st.number_input("Minimum Payment ($)", min_value=0.0, step=10.0, key=f"minpay_{i}")
-    revolving = False
-    monthly_new_charges = 0.0
-    if debt_type == "Credit Card":
-        revolving = st.checkbox("Is this revolving debt?", key=f"rev_{i}")
-        if revolving:
-            monthly_new_charges = st.number_input("Monthly new charges ($)", min_value=0.0, step=10.0, key=f"charges_{i}")
+    # Scenario B: Invest
+    fv_b = _future_value(inp.monthly_free_cash, inp.months, inp.invest_return) + inp.lump_sum
+    interest_paid_b, months_b = _amortize(inp.debt_balance, inp.apr, inp.min_payment, inp.months)
+    res.append(ScenarioResult(
+        name="Invest",
+        end_balance=0.0,
+        interest_saved=0.0,
+        investment_value=fv_b,
+        liquidity=max(0.0, inp.emergency_fund_goal),
+        time_to_debt_free_months=months_b
+    ))
 
-    debts.append({
-        "type": debt_type,
-        "balance": balance,
-        "apr": apr,
-        "min_payment": min_payment,
-        "revolving": revolving,
-        "monthly_new_charges": monthly_new_charges
-    })
+    # Scenario C: Save
+    liquidity_c = min(inp.emergency_fund_goal, inp.lump_sum) + inp.monthly_free_cash * min(inp.months, 12)
+    interest_paid_c, months_c = _amortize(inp.debt_balance, inp.apr, inp.min_payment, inp.months)
+    res.append(ScenarioResult(
+        name="Save",
+        end_balance=0.0,
+        interest_saved=0.0,
+        investment_value=0.0,
+        liquidity=liquidity_c,
+        time_to_debt_free_months=months_c
+    ))
 
-# -----------------------------
-# Section 3: Cash & Goals
-# -----------------------------
-st.header("Step 3: Cash Flow & Goals")
+    # Scenario D: Hybrid
+    lump_debt = 0.5 * inp.lump_sum
+    lump_invest = 0.25 * inp.lump_sum
+    lump_save = 0.25 * inp.lump_sum
+    bal_d = max(0.0, inp.debt_balance - min(lump_debt, inp.debt_balance))
+    interest_paid_d, months_d = _amortize(bal_d, inp.apr, inp.min_payment + 0.5 * inp.monthly_free_cash, inp.months)
+    fv_d = _future_value(0.25 * inp.monthly_free_cash, inp.months, inp.invest_return) + lump_invest
+    liquidity_d = lump_save + 0.25 * inp.monthly_free_cash * min(inp.months, 12)
 
-lump_sum = st.number_input("Expected Lump Sum ($)", min_value=0.0, step=100.0)
-monthly_free_cash = st.number_input("Monthly Free Cash ($)", min_value=0.0, step=50.0)
-emergency_fund_goal = st.number_input("Emergency Fund Goal ($)", min_value=0.0, step=500.0)
+    res.append(ScenarioResult(
+        name="Hybrid",
+        end_balance=0.0,
+        interest_saved=max(0.0, _amortize(inp.debt_balance, inp.apr, inp.min_payment, inp.months)[0] - interest_paid_d),
+        investment_value=fv_d,
+        liquidity=liquidity_d,
+        time_to_debt_free_months=months_d
+    ))
 
-timeline_option = st.radio("Do you want to provide your own time horizon (months)?", ["Yes", "No"])
-if timeline_option == "Yes":
-    months = st.slider("Horizon (months)", 6, 360, 60)
-else:
-    months = None  # Tool will calculate later if needed
+    # Scenario E: Debt + EF Goal
+    lump_to_debt = 0.7 * inp.lump_sum
+    lump_to_ef = 0.3 * inp.lump_sum
+    bal_e = max(0.0, inp.debt_balance - lump_to_debt)
+    interest_paid_e, months_e = _amortize(bal_e, inp.apr, inp.min_payment + 0.7 * inp.monthly_free_cash, inp.months)
+    ef_accumulated = lump_to_ef + (0.3 * inp.monthly_free_cash * min(inp.months, 24))
 
-# -----------------------------
-# Section 4: Run Scenarios
-# -----------------------------
-st.header("Step 4: Run Scenarios")
+    res.append(ScenarioResult(
+        name="Debt+EF",
+        end_balance=0.0,
+        interest_saved=max(0.0, _amortize(inp.debt_balance, inp.apr, inp.min_payment, inp.months)[0] - interest_paid_e),
+        investment_value=0.0,
+        liquidity=ef_accumulated,
+        time_to_debt_free_months=months_e
+    ))
+
+    return res
+
+# ============================================================
+# NARRATIVES (merged)
+# ============================================================
+
+def generate_improved_narratives(results: List[ScenarioResult], inp: ScenarioInput):
+    narratives = {}
+    for r in results:
+        if r.name == "Pay Debt":
+            narratives[r.name] = f"""
+            ### 🎯 Pay Debt
+            You aggressively pay off your debt. Debt free in **{r.time_to_debt_free_months} months**, saving **${r.interest_saved:,.0f}** in interest.
+            """
+        elif r.name == "Invest":
+            narratives[r.name] = f"""
+            ### 📈 Invest
+            By investing all funds, you could build **${r.investment_value:,.0f}** in {inp.months} months. Debt remains on minimum payment schedule.
+            """
+        elif r.name == "Save":
+            narratives[r.name] = f"""
+            ### 💰 Save
+            You build an emergency fund of **${r.liquidity:,.0f}** within {min(inp.months,12)} months. Debt payoff is delayed.
+            """
+        elif r.name == "Hybrid":
+            narratives[r.name] = f"""
+            ### ⚖️ Hybrid
+            Split approach:  
+            • Save **${r.liquidity:,.0f}**  
+            • Invest **${r.investment_value:,.0f}**  
+            • Save **${r.interest_saved:,.0f}** in interest by paying debt faster.
+            """
+        elif r.name == "Debt+EF":
+            narratives[r.name] = f"""
+            ### 🔗 Debt + Emergency Fund
+            Prioritize debt with {70}% of funds and build EF with {30}%.  
+            • EF grows to **${r.liquidity:,.0f}**  
+            • Debt free in **{r.time_to_debt_free_months} months**, saving **${r.interest_saved:,.0f}** interest.
+            """
+    return narratives
+
+# ============================================================
+# STREAMLIT APP UI
+# ============================================================
+
+st.title("💰 Financial Scenario Planner (Standalone)")
+
+st.sidebar.header("Inputs")
+
+inp = ScenarioInput(
+    lump_sum=st.sidebar.number_input("Expected lump sum ($)", min_value=0, value=5000, step=500),
+    monthly_free_cash=st.sidebar.number_input("Monthly free cash ($)", min_value=0, value=500, step=50),
+    debt_balance=st.sidebar.number_input("Debt balance ($)", min_value=0, value=5000, step=500),
+    apr=st.sidebar.number_input("Debt APR (%)", min_value=0.0, max_value=100.0, value=24.0, step=0.5),
+    min_payment=st.sidebar.number_input("Minimum debt payment ($)", min_value=0, value=120, step=10),
+    invest_return=st.sidebar.number_input("Expected investment return (%)", min_value=-100.0, max_value=100.0, value=7.0, step=0.5),
+    emergency_fund_goal=st.sidebar.number_input("Emergency fund goal ($)", min_value=0, value=15000, step=500),
+    months=st.sidebar.slider("Timeline (months)", 6, 120, 60),
+    assumed_happiness=st.sidebar.slider("Happiness threshold (0-100)", 0, 100, 60)
+)
 
 if st.button("Run scenarios"):
-    try:
-        # Build ScenarioInput for engine
-        total_debt = sum(d["balance"] for d in debts)
-        avg_apr = sum(d["apr"] for d in debts) / len(debts) if debts else 0
-        avg_min_payment = sum(d["min_payment"] for d in debts) / len(debts) if debts else 0
+    results = run_scenarios(inp)
+    df = pd.DataFrame([r.dict() for r in results])
+    st.subheader("📑 Scenario Results")
+    st.dataframe(df)
 
-        inp = ScenarioInput(
-            lump_sum=lump_sum,
-            monthly_free_cash=monthly_free_cash,
-            debt_balance=total_debt,
-            apr=avg_apr,
-            min_payment=avg_min_payment,
-            invest_return=7.0,  # default 7% annual return
-            emergency_fund_goal=emergency_fund_goal,
-            months=months if months else 60,
-            assumed_happiness=happiness_score
-        )
-
-        results = run_scenarios(inp)
-
-        # Convert results to dict for narrative
-        scenarios_dict = {r.name: r.dict() for r in results}
-        allocation_data = {
-            "initial_amount": lump_sum,
-            "monthly_amount": monthly_free_cash,
-            "duration_months": months if months else 60,
-            "debt_apr": avg_apr / 100,
-            "investment_return": 0.07,
-            "emergency_fund_goal": emergency_fund_goal,
-            "scenarios": scenarios_dict
-        }
-
-        narratives = generate_improved_narratives(allocation_data)
-
-        # Show narratives
-        display_narratives_streamlit(narratives)
-
-        # Results Table
-        st.subheader("📊 Scenario Results")
-        df = pd.DataFrame([r.dict() for r in results])
-        df.rename(columns={
-            "name": "Scenario",
-            "end_balance": "Ending Balance ($)",
-            "interest_saved": "Interest Saved ($)",
-            "investment_value": "Investment Value ($)",
-            "liquidity": "Liquidity ($)",
-            "time_to_debt_free_months": "Debt-Free Timeline (months)"
-        }, inplace=True)
-        st.dataframe(df)
-
-        # Export to Excel
-        st.download_button(
-            label="Download Results as Excel",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="scenario_results.csv",
-            mime="text/csv"
-        )
-
-    except Exception as e:
-        st.error(f"An error occurred: {e}")
-
-# -----------------------------
-# Section 5: Follow-up Questions (long-term scoring)
-# -----------------------------
-st.header("Step 5: Ongoing Financial Well-Being")
-
-st.markdown("Every 3 months, answer a few more questions to refine your score:")
-
-for i, q in enumerate(ADDITIONAL_QUESTIONS[:3], start=1):
-    st.slider(q, 0, 5, 3, key=f"followup_{i}")
+    narratives = generate_improved_narratives(results, inp)
+    st.subheader("📊 Narratives")
+    for name, text in narratives.items():
+        st.markdown(text)
